@@ -1,196 +1,247 @@
-import { useState } from "react";
-
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001";
-
-function b64ToUrl(b64, mime = "image/png") {
-  try {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return URL.createObjectURL(new Blob([bytes], { type: mime }));
-  } catch (e) {
-    console.error("Error converting base64 to URL:", e);
-    return "";
-  }
-}
+import { useState, useEffect } from "react";
 
 export default function App() {
   const [prompt, setPrompt] = useState("");
-
   const [files, setFiles] = useState([]);
-  const [apiKey, setApiKey] = useState(""); // Ô nhập API key
+  const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState("");
   const [images, setImages] = useState([]);
-  const [text, setText] = useState("");
+
+  // Load API key từ localStorage
+  useEffect(() => {
+    const savedApiKey = localStorage.getItem("gemini_api_key");
+    if (savedApiKey) setApiKey(savedApiKey);
+  }, []);
+
+  // Lưu API key khi thay đổi
+  useEffect(() => {
+    if (apiKey.trim()) localStorage.setItem("gemini_api_key", apiKey.trim());
+  }, [apiKey]);
+
+  const handleFileChange = (e) => {
+    const selectedFiles = e.target.files;
+    if (!selectedFiles) return;
+
+    const validFiles = Array.from(selectedFiles).filter((file) => {
+      if (file.size > 10 * 1024 * 1024) {
+        setLog("❌ File quá lớn (max 10MB)");
+        return false;
+      }
+      if (!file.type.startsWith("image/")) {
+        setLog("❌ Chỉ chấp nhận file ảnh");
+        return false;
+      }
+      return true;
+    });
+
+    setFiles(validFiles.slice(0, 3));
+    setLog(`📂 Đã chọn ${validFiles.length} ảnh`);
+  };
+
+  const removeFile = (index) => {
+    setFiles(files.filter((_, i) => i !== index));
+  };
 
   async function handleGenerate() {
     if (!prompt.trim()) {
-      setLog("❌ Vui lòng nhập prompt");
+      setLog("❌ Vui lòng nhập mô tả");
+      return;
+    }
+    if (!apiKey.trim()) {
+      setLog("❌ Cần API key từ Google AI Studio");
       return;
     }
 
     setBusy(true);
     setImages([]);
-    setText("");
-    setLog("Đang gửi...");
-
-    const fd = new FormData();
-    fd.append("prompt", prompt);
-
-    if (files.length > 0) {
-      fd.append("image", files[0]); 
-    }
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); 
+      setLog("⏳ Đang gửi yêu cầu...");
 
-      const headers = {};
-      if (apiKey.trim()) headers["x-api-key"] = apiKey.trim();
+      // Convert file → base64
+      const convertFileToBase64 = (file) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result.split(",")[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
 
-      const r = await fetch(`${API_BASE}/generate`, {
-        method: "POST",
-        body: fd,
-        headers,
-        signal: controller.signal,
-      });
+      const imageParts = await Promise.all(
+        files.map(async (file) => ({
+          inlineData: {
+            mimeType: file.type,
+            data: await convertFileToBase64(file),
+          },
+        }))
+      );
 
-      clearTimeout(timeoutId);
+      const requestData = {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt },
+              ...imageParts, // có thể rỗng nếu chỉ chạy Text-to-Image
+            ],
+          },
+        ],
+      };
 
-      if (!r.ok) {
-        const errorText = await r.text();
-        throw new Error(`HTTP ${r.status}: ${errorText || "Request failed"}`);
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey.trim()}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestData),
+        }
+      );
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new Error("🚨 Quota API đã hết, hãy thử API key khác.");
+        }
+        throw new Error(`API Error: ${response.status}`);
       }
 
-      const data = await r.json();
+      const data = await response.json();
+      let foundImage = false;
 
-      
-      if (!data.success) {
-        throw new Error(`${data.error || "GENERATION_FAILED"}: ${data.message || ""}`);
+      if (data.candidates?.[0]?.content?.parts) {
+        for (const part of data.candidates[0].content.parts) {
+          // Nếu trả về ảnh
+          if (part.inlineData?.data) {
+            const url = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+            setImages((prev) => [...prev, url]);
+            foundImage = true;
+          }
+          // Nếu trả về text
+          if (part.text) {
+            setLog(part.text);
+          }
+        }
       }
 
-      if (data.type === "image" && data.data) {
-        const url = b64ToUrl(data.data, data.mime || "image/png");
-        setImages([url]);
-        setText("");
-        setLog(data.mockUsed ? " Đang dùng ảnh mock (thiếu key/hết quota)" : " Trả về ảnh");
-      } else if (data.type === "text") {
-        setText(data.text || "");
-        setImages([]);
-        setLog("Trả về text");
-      } else {
-        setLog(" Không nhận được kết quả hợp lệ từ server.");
+      if (!foundImage) {
+        setLog("⚠️ Không có ảnh trả về, chỉ nhận được text.");
       }
-    } catch (e) {
-      if (e.name === "AbortError") {
-        setLog("Yêu cầu bị hủy do timeout");
-      } else {
-        setLog(`Lỗi: ${e.message || String(e)}`);
-      }
-      console.error("Fetch error:", e);
+    } catch (error) {
+      console.error("Error:", error);
+      setLog(`❌ Lỗi: ${error.message}`);
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="max-w-5xl mx-auto p-6 grid gap-6">
-        <h1 className="text-2xl font-bold text-center">Gemini Image Editor</h1>
+    <div className="min-h-screen bg-gray-50 p-6">
+      <div className="max-w-4xl mx-auto space-y-6">
+        {/* Header */}
+        <header className="text-center">
+          <h1 className="text-3xl font-bold text-gray-900">Gemini Image Editor</h1>
+          <p className="text-gray-600">Text-to-Image & Image-to-Image với Google Gemini</p>
+        </header>
 
-        <section className="bg-white p-4 rounded-2xl shadow grid gap-3">
-          <label className="text-sm font-medium">API Key (tùy chọn)</label>
+        {/* API Key */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-lg font-semibold mb-4">API Key</h2>
           <input
             type="password"
-            className="border rounded px-3 py-2 outline-none focus:ring"
-            placeholder="Dán API key của bạn vào đây..."
+            className="w-full border rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500"
+            placeholder="Nhập Google Gemini API key..."
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             disabled={busy}
           />
+        </div>
 
-          <label className="text-sm font-medium mt-2">Prompt</label>
+        {/* Prompt */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-lg font-semibold mb-4">Mô tả</h2>
           <textarea
-            className="border rounded px-3 py-2 outline-none focus:ring min-h-[90px]"
+            className="w-full border rounded-lg px-4 py-3 h-24 focus:ring-2 focus:ring-blue-500"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Nhập mô tả chỉnh sửa ảnh..."
+            placeholder="Ví dụ: Vẽ phong cách anime, thêm nền hoàng hôn..."
             disabled={busy}
           />
+        </div>
 
-          <div className="grid gap-2">
-  <label className="text-sm font-medium">Ảnh đầu vào (tùy chọn)</label>
+        {/* Upload */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-lg font-semibold mb-4">Ảnh đầu vào (tùy chọn, tối đa 3)</h2>
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={handleFileChange}
+            disabled={busy}
+            className="w-full border rounded-lg px-3 py-2 cursor-pointer"
+          />
 
-  <input
-    type="file"
-    accept="image/*"
-    multiple
-    onChange={(e) => setFiles(e.target.files ? Array.from(e.target.files) : [])}
-    disabled={busy}
-    className="block w-fit border rounded px-3 py-1 text-sm cursor-pointer"
-  />
+          {files.length > 0 && (
+            <div className="mt-4 grid grid-cols-3 gap-4">
+              {files.map((file, index) => {
+                const url = URL.createObjectURL(file);
+                return (
+                  <div key={index} className="relative">
+                    <img
+                      src={url}
+                      alt={file.name}
+                      className="w-full h-48 object-cover rounded border"
+                    />
+                    <button
+                      onClick={() => removeFile(index)}
+                      className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 text-white rounded-full text-xs"
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
-  {files.length > 0 && (
-    <div className="flex flex-wrap gap-3 mt-2">
-      {files.map((f, i) => {
-        const url = URL.createObjectURL(f);
-        return (
-          <div key={i} className="w-24">
-            <img
-              src={url}
-              alt={f.name}
-              className="w-24 h-24 object-cover rounded border"
-            />
-            <p className="text-xs text-center mt-1 truncate">{f.name}</p>
-          </div>
-        );
-      })}
-    </div>
-  )}
-</div>
-
-
+        {/* Generate */}
+        <div className="bg-white p-6 rounded-lg shadow">
           <button
             onClick={handleGenerate}
-            disabled={busy}
-            className="w-fit px-4 py-2 rounded-xl bg-black text-white disabled:opacity-50"
+            disabled={busy || !prompt.trim() || !apiKey.trim()}
+            className="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold disabled:opacity-50 hover:bg-blue-700"
           >
-            {busy ? "Đang chạy..." : "Generate"}
+            {busy ? "⏳ Đang xử lý..." : "🚀 Generate"}
           </button>
-          <pre className="text-xs text-slate-600 whitespace-pre-wrap">{log}</pre>
-        </section>
 
-        <section className="bg-white p-4 rounded-2xl shadow grid gap-3">
-          <h2 className="text-sm font-medium">Kết quả</h2>
-          {!images.length && !text && (
-            <div className="text-sm text-slate-500">Chưa có kết quả.</div>
+          {log && (
+            <div className="mt-4 p-3 bg-gray-100 rounded-lg">
+              <p className="text-sm text-gray-700">{log}</p>
+            </div>
           )}
-          {images.length > 0 && (
+        </div>
+
+        {/* Kết quả */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-lg font-semibold mb-4">Kết quả</h2>
+          {images.length > 0 ? (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {images.map((url, i) => (
                 <figure key={i} className="rounded-xl overflow-hidden border">
                   <img src={url} alt={`out-${i}`} className="w-full" />
                   <figcaption className="p-2 text-xs flex justify-between">
                     <span>Ảnh #{i + 1}</span>
-                    <a
-                      className="underline"
-                      href={url}
-                      download={`gemini-output-${i + 1}.png`}
-                    >
+                    <a href={url} download={`gemini-output-${i + 1}.png`} className="underline">
                       Tải xuống
                     </a>
                   </figcaption>
                 </figure>
               ))}
             </div>
+          ) : (
+            <p className="text-gray-500">Chưa có ảnh kết quả</p>
           )}
-          {text && (
-            <pre className="p-3 border rounded-xl text-sm whitespace-pre-wrap">
-              {text}
-            </pre>
-          )}
-        </section>
+        </div>
       </div>
     </div>
   );
