@@ -5,11 +5,12 @@
   "type": "module",
   "homepage": "https://dongduy1412.github.io/gemini-app",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "deploy": "vite build --base=/gemini-app/ && gh-pages -d dist -b gh-pages"
-  },
+  "dev": "vite",
+  "build": "vite build",
+  "preview": "vite preview",
+  "predeploy": "npm run build",
+  "deploy": "gh-pages -d dist -b gh-pages"
+},
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "react": "^19.1.1",
